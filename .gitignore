@@ -3,4 +3,6 @@ build/
 *.test
 .idea/
 .vscode/
+.claude/
+*.stackdump
 go.sum

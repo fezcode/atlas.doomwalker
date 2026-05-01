@@ -93,9 +93,13 @@ func main() {
 
 func runTUI(scan func(chan<- any) (*mft.FileNode, error)) {
 	model := ui.NewModel()
-	p := tea.NewProgram(model, tea.WithAltScreen())
 
-	go func() {
+	// We need the *tea.Program reference inside the rescan callback so the
+	// background scan can post messages back; create the program first, then
+	// patch the model's Rescan field via a closure.
+	var p *tea.Program
+
+	runScan := func() {
 		pChan := make(chan any, 8)
 		done := make(chan struct{})
 		go func() {
@@ -109,17 +113,23 @@ func runTUI(scan func(chan<- any) (*mft.FileNode, error)) {
 			}
 			close(done)
 		}()
-
 		root, err := scan(pChan)
 		close(pChan)
 		<-done
-
 		if err != nil {
 			p.Send(ui.ScanErrorMsg{Err: err})
 			return
 		}
 		p.Send(ui.ScanFinishedMsg{Root: root})
-	}()
+	}
+
+	model.Rescan = func() tea.Cmd {
+		go runScan()
+		return nil
+	}
+	p = tea.NewProgram(model, tea.WithAltScreen())
+
+	go runScan()
 
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error: %v\n", err)

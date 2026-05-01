@@ -43,7 +43,6 @@ var (
 			Bold(true)
 
 	subtleStyle  = lipgloss.NewStyle().Foreground(cMuted)
-	pathStyle    = lipgloss.NewStyle().Foreground(cDim)
 	sizeStyle    = lipgloss.NewStyle().Foreground(cWarn).Bold(true)
 	helpKeyStyle = lipgloss.NewStyle().Foreground(cAccent).Bold(true)
 	helpDescStyle = lipgloss.NewStyle().Foreground(cMuted)
@@ -99,6 +98,13 @@ type Model struct {
 	ConfirmDelete bool
 	Toast         string
 	ToastIsError  bool
+
+	// Set of node pointers currently being deleted in the background.
+	// Members render dimmed and aren't selectable.
+	Deleting map[*mft.FileNode]bool
+
+	// Rescan triggers a fresh scan; supplied by main.go.
+	Rescan func() tea.Cmd
 }
 
 func NewModel() Model {
@@ -120,6 +126,13 @@ type ScanFinishedMsg struct{ Root *mft.FileNode }
 type ScanErrorMsg struct{ Err error }
 type ProgressMsg float64
 type StatusMsg string
+
+// DeleteDoneMsg arrives when an async delete finishes.
+type DeleteDoneMsg struct {
+	Node *mft.FileNode
+	Path string
+	Err  error
+}
 
 func (m *Model) refreshCurrentNodes() {
 	m.CurrentNodes = m.CurrentNodes[:0]
@@ -164,12 +177,43 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case ScanFinishedMsg:
 		m.Scanning = false
+		m.Error = nil
 		m.Root = msg.Root
-		m.CurrentNode = msg.Root
+		// Preserve the user's location across rescans by re-walking the path.
+		if m.CurrentNode != nil {
+			m.CurrentNode = relocate(msg.Root, m.CurrentNode)
+		} else {
+			m.CurrentNode = msg.Root
+		}
 		m.refreshCurrentNodes()
 		return m, nil
 	case ScanErrorMsg:
 		m.Error = msg.Err
+		m.Scanning = false
+		return m, nil
+	case DeleteDoneMsg:
+		delete(m.Deleting, msg.Node)
+		if msg.Err != nil {
+			m.Toast = "Delete failed: " + msg.Err.Error()
+			m.ToastIsError = true
+			return m, nil
+		}
+		// Detach from tree and propagate size up.
+		if parent := msg.Node.Parent; parent != nil {
+			for k, v := range parent.Children {
+				if v == msg.Node {
+					delete(parent.Children, k)
+					break
+				}
+			}
+			removed := msg.Node.Size
+			for cur := parent; cur != nil; cur = cur.Parent {
+				cur.Size -= removed
+			}
+		}
+		m.refreshCurrentNodes()
+		m.Toast = "Deleted " + msg.Path
+		m.ToastIsError = false
 		return m, nil
 	case tea.WindowSizeMsg:
 		m.Width = msg.Width
@@ -187,8 +231,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.ConfirmDelete {
 			switch msg.String() {
 			case "y", "Y", "enter":
-				m.performDelete()
 				m.ConfirmDelete = false
+				return m, m.beginDelete()
 			case "n", "N", "esc", "q", "ctrl+c":
 				m.ConfirmDelete = false
 				m.Toast = ""
@@ -206,8 +250,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.openInExplorer()
 			return m, nil
 		case "d":
-			if sel := m.selected(); sel != nil && sel != m.Root {
+			if sel := m.selected(); sel != nil && sel != m.Root && !m.Deleting[sel] {
 				m.ConfirmDelete = true
+			}
+			return m, nil
+		case "r":
+			if m.Rescan != nil {
+				m.Scanning = true
+				m.Status = "Rescanning"
+				m.ProgressAmount = 0
+				m.Toast = ""
+				return m, m.Rescan()
 			}
 			return m, nil
 		case "up", "k":
@@ -322,7 +375,7 @@ func (m Model) renderMain() string {
 	listPanel := m.renderList(listW, innerH)
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, mapPanel, " ", listPanel)
-	view := lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+	view := header + "\n" + body + "\n" + footer
 
 	if m.ConfirmDelete {
 		view = overlay(view, m.renderConfirm(), w, h)
@@ -402,16 +455,26 @@ func spliceLine(dst, src string, x, totalW int) string {
 
 func (m Model) renderHeader(w int) string {
 	title := titleStyle.Render(" ATLAS · DOOMWALKER ")
-	crumbs := breadcrumb(m.CurrentNode)
-	size := sizeStyle.Render(FormatSize(m.CurrentNode.Size))
-	count := subtleStyle.Render(fmt.Sprintf("(%d items)", len(m.CurrentNodes)))
-	left := title + " " + pathStyle.Render(truncMiddle(crumbs, w-32))
-	right := size + " " + count
-	pad := w - lipgloss.Width(left) - lipgloss.Width(right) - 2
+	sizeStr := sizeStyle.Render(FormatSize(m.CurrentNode.Size))
+	countStr := subtleStyle.Render(fmt.Sprintf("(%d items)", len(m.CurrentNodes)))
+	right := sizeStr + " " + countStr
+
+	titleW := lipgloss.Width(title)
+	rightW := lipgloss.Width(right)
+
+	pathBudget := w - titleW - rightW - 4
+	if pathBudget < 4 {
+		pathBudget = 4
+	}
+	pathRaw := truncMiddle(nodePath(m.CurrentNode), pathBudget)
+	pathW := len(pathRaw)
+	pathStyled := lipgloss.NewStyle().Foreground(cFolder).Bold(true).Render(pathRaw)
+
+	pad := w - titleW - 2 - pathW - rightW - 1
 	if pad < 1 {
 		pad = 1
 	}
-	return left + strings.Repeat(" ", pad) + right
+	return title + "  " + pathStyled + strings.Repeat(" ", pad) + right
 }
 
 func (m Model) renderFooter(w int) string {
@@ -421,6 +484,7 @@ func (m Model) renderFooter(w int) string {
 		{"bksp", "back"},
 		{"o", "explorer"},
 		{"d", "delete"},
+		{"r", "refresh"},
 		{"s", "sort:" + m.Sort.String()},
 		{".", "hidden:" + onOff(m.ShowHidden)},
 		{"q", "quit"},
@@ -436,11 +500,13 @@ func (m Model) renderFooter(w int) string {
 		Render(bar)
 }
 
+// renderTreemap composes the treemap by emitting one styled span per
+// horizontal run of same-tile cells. This is ~50× faster than calling
+// lipgloss.Render per cell, which mattered when scrolling fast.
 func (m Model) renderTreemap(w, h int) string {
 	if w < 10 || h < 5 {
 		return strings.Repeat(" ", w)
 	}
-	// Reserve border (2 in each dim).
 	innerW := w - 2
 	innerH := h - 2
 
@@ -454,74 +520,142 @@ func (m Model) renderTreemap(w, h int) string {
 	}
 	rects := treemap.SquarifiedTreemap(in, 0, 0, innerW, innerH)
 
-	canvas := make([][]string, innerH)
-	for i := range canvas {
-		canvas[i] = make([]string, innerW)
-		for j := range canvas[i] {
-			canvas[i][j] = lipgloss.NewStyle().Background(cBg).Render(" ")
+	// owner[y][x] = tile index, or -1 for background.
+	owner := make([][]int16, innerH)
+	for i := range owner {
+		owner[i] = make([]int16, innerW)
+		for j := range owner[i] {
+			owner[i][j] = -1
 		}
 	}
-
 	for i, r := range rects {
-		color := tilePalette[i%len(tilePalette)]
-		var fill lipgloss.Style
-		if i == m.SelectedIndex {
-			fill = lipgloss.NewStyle().Background(cAccent).Foreground(lipgloss.Color("#000"))
-		} else {
-			fill = lipgloss.NewStyle().Background(color).Foreground(lipgloss.Color("#0a0a0a"))
-		}
-		// Fill cell
 		for dy := 0; dy < r.H; dy++ {
-			for dx := 0; dx < r.W; dx++ {
-				y, x := r.Y+dy, r.X+dx
-				if y < 0 || y >= innerH || x < 0 || x >= innerW {
-					continue
-				}
-				canvas[y][x] = fill.Render(" ")
+			y := r.Y + dy
+			if y < 0 || y >= innerH {
+				continue
 			}
-		}
-		// Label if it fits.
-		if r.W >= 6 && r.H >= 1 {
-			label := r.Label
-			sizeLabel := FormatSize(r.Size)
-			if r.H >= 3 && r.W >= len(label)+2 && r.W >= len(sizeLabel)+2 {
-				placeText(canvas, r, label, 0, fill.Bold(true), innerW, innerH)
-				placeText(canvas, r, sizeLabel, 1, fill, innerW, innerH)
-			} else {
-				txt := label
-				if len(txt) > r.W-2 {
-					txt = txt[:max(1, r.W-3)] + "…"
-				}
-				placeText(canvas, r, txt, 0, fill.Bold(true), innerW, innerH)
+			row := owner[y]
+			x0 := r.X
+			x1 := r.X + r.W
+			if x0 < 0 {
+				x0 = 0
+			}
+			if x1 > innerW {
+				x1 = innerW
+			}
+			for x := x0; x < x1; x++ {
+				row[x] = int16(i)
 			}
 		}
 	}
 
-	var b strings.Builder
-	for _, row := range canvas {
-		b.WriteString(strings.Join(row, ""))
-		b.WriteString("\n")
-	}
-	return panelStyle.Width(w).Height(h).Render(strings.TrimRight(b.String(), "\n"))
-}
-
-func placeText(canvas [][]string, r treemap.Rect, text string, lineOffset int, style lipgloss.Style, innerW, innerH int) {
-	if len(text) > r.W-1 {
-		if r.W-2 < 1 {
+	// Sparse label overlay: chars[y][x] = rune to draw on top of the fill.
+	chars := make(map[int64]rune)
+	bold := make(map[int64]bool)
+	put := func(x, y int, r rune, b bool) {
+		if y < 0 || y >= innerH || x < 0 || x >= innerW {
 			return
 		}
-		text = text[:r.W-2] + "…"
+		chars[int64(y)<<32|int64(x)] = r
+		if b {
+			bold[int64(y)<<32|int64(x)] = true
+		}
 	}
-	y := r.Y + r.H/2 - 1 + lineOffset
-	x := r.X + (r.W-len(text))/2
-	for i, ch := range text {
-		yy, xx := y, x+i
-		if yy < 0 || yy >= innerH || xx < 0 || xx >= innerW {
+	for i, r := range rects {
+		if r.W < 6 || r.H < 1 {
 			continue
 		}
-		canvas[yy][xx] = style.Render(string(ch))
+		label := r.Label
+		sizeLabel := FormatSize(r.Size)
+		two := r.H >= 3 && r.W >= len(label)+2 && r.W >= len(sizeLabel)+2
+		drawText := func(text string, lineOffset int, b bool) {
+			if len(text) > r.W-1 {
+				if r.W-2 < 1 {
+					return
+				}
+				text = text[:r.W-2] + "…"
+			}
+			y := r.Y + r.H/2 - 1 + lineOffset
+			x := r.X + (r.W-len(text))/2
+			for j, ch := range text {
+				put(x+j, y, ch, b)
+			}
+		}
+		if two {
+			drawText(label, 0, true)
+			drawText(sizeLabel, 1, false)
+		} else {
+			txt := label
+			if len(txt) > r.W-2 {
+				if r.W-3 < 1 {
+					continue
+				}
+				txt = txt[:r.W-3] + "…"
+			}
+			drawText(txt, 0, true)
+		}
+		_ = i
 	}
+
+	// Pre-build styles once per tile (varying by selection).
+	tileStyles := make([]lipgloss.Style, len(rects))
+	tileBold := make([]lipgloss.Style, len(rects))
+	for i := range rects {
+		var st lipgloss.Style
+		if i == m.SelectedIndex {
+			st = lipgloss.NewStyle().Background(cAccent).Foreground(lipgloss.Color("#000"))
+		} else {
+			color := tilePalette[i%len(tilePalette)]
+			st = lipgloss.NewStyle().Background(color).Foreground(lipgloss.Color("#0a0a0a"))
+		}
+		tileStyles[i] = st
+		tileBold[i] = st.Bold(true)
+	}
+	bgStyle := lipgloss.NewStyle().Background(cBg)
+
+	// Emit one span per run of same (tileIdx, isBold).
+	var b strings.Builder
+	for y := 0; y < innerH; y++ {
+		runStart := 0
+		runOwner := owner[y][0]
+		runBold := bold[int64(y)<<32]
+		flush := func(end int) {
+			seg := make([]rune, 0, end-runStart)
+			for x := runStart; x < end; x++ {
+				if r, ok := chars[int64(y)<<32|int64(x)]; ok {
+					seg = append(seg, r)
+				} else {
+					seg = append(seg, ' ')
+				}
+			}
+			s := string(seg)
+			switch {
+			case runOwner < 0:
+				b.WriteString(bgStyle.Render(s))
+			case runBold:
+				b.WriteString(tileBold[runOwner].Render(s))
+			default:
+				b.WriteString(tileStyles[runOwner].Render(s))
+			}
+		}
+		for x := 1; x < innerW; x++ {
+			ob := bold[int64(y)<<32|int64(x)]
+			if owner[y][x] != runOwner || ob != runBold {
+				flush(x)
+				runStart = x
+				runOwner = owner[y][x]
+				runBold = ob
+			}
+		}
+		flush(innerW)
+		b.WriteString("\n")
+	}
+	// Width/Height in lipgloss set the *inner* content area; the rounded
+	// border adds 1 row/col on each side, so subtract 2 to keep the panel
+	// total at (w, h).
+	return panelStyle.Width(w - 2).Height(h - 2).Render(strings.TrimRight(b.String(), "\n"))
 }
+
 
 func (m Model) renderList(w, h int) string {
 	innerW := w - 2
@@ -560,19 +694,26 @@ func (m Model) renderList(w, h int) string {
 			name = name[:nameW-1] + "…"
 		}
 		size := FormatSize(n.Size)
-		line := fmt.Sprintf("%s %-*s %10s", icon, nameW, name, size)
-		if i == m.SelectedIndex {
+		mark := " "
+		if m.Deleting[n] {
+			mark = "✗"
+			nameColor = cMuted
+		}
+		line := fmt.Sprintf("%s%s %-*s %10s", mark, icon, nameW-1, name, size)
+		switch {
+		case m.Deleting[n]:
+			rows = append(rows, lipgloss.NewStyle().Foreground(cMuted).Faint(true).Render(line))
+		case i == m.SelectedIndex:
 			rows = append(rows, rowSelectedStyle.Width(innerW).Render(line))
-		} else {
-			styled := lipgloss.NewStyle().Foreground(nameColor).Render(line)
-			rows = append(rows, styled)
+		default:
+			rows = append(rows, lipgloss.NewStyle().Foreground(nameColor).Render(line))
 		}
 	}
 	for len(rows)-2 < maxRows {
 		rows = append(rows, "")
 	}
 	body := strings.Join(rows, "\n")
-	return panelStyle.Width(w).Height(h).Render(body)
+	return panelStyle.Width(w - 2).Height(h - 2).Render(body)
 }
 
 func (m *Model) selected() *mft.FileNode {
@@ -628,49 +769,54 @@ func (m *Model) openInExplorer() {
 	m.ToastIsError = false
 }
 
-func (m *Model) performDelete() {
+// beginDelete returns a tea.Cmd that performs the delete in a goroutine, so
+// large directory removals don't block the event loop.
+func (m *Model) beginDelete() tea.Cmd {
 	sel := m.selected()
 	if sel == nil || sel == m.Root {
-		return
+		return nil
 	}
-	path := nodePath(sel)
-	var err error
-	if sel.IsDir {
-		err = os.RemoveAll(path)
-	} else {
-		err = os.Remove(path)
+	if m.Deleting == nil {
+		m.Deleting = map[*mft.FileNode]bool{}
 	}
-	if err != nil {
-		m.Toast = "Delete failed: " + err.Error()
-		m.ToastIsError = true
-		return
-	}
-	// Detach from tree and propagate size up.
-	parent := sel.Parent
-	if parent != nil {
-		for k, v := range parent.Children {
-			if v == sel {
-				delete(parent.Children, k)
-				break
-			}
-		}
-		removed := sel.Size
-		for cur := parent; cur != nil; cur = cur.Parent {
-			cur.Size -= removed
-		}
-	}
-	m.refreshCurrentNodes()
-	m.Toast = "Deleted " + path
+	m.Deleting[sel] = true
+	m.Toast = "Deleting " + sel.Name + "…"
 	m.ToastIsError = false
+	path := nodePath(sel)
+	isDir := sel.IsDir
+	return func() tea.Msg {
+		var err error
+		if isDir {
+			err = os.RemoveAll(path)
+		} else {
+			err = os.Remove(path)
+		}
+		return DeleteDoneMsg{Node: sel, Path: path, Err: err}
+	}
 }
 
-func breadcrumb(n *mft.FileNode) string {
-	var parts []string
-	for cur := n; cur != nil; cur = cur.Parent {
-		parts = append([]string{cur.Name}, parts...)
+// relocate finds a node in `newRoot` whose name-path matches `target`'s. Used
+// after a rescan so the user lands back where they were if the path still
+// exists; otherwise returns the new root.
+func relocate(newRoot, target *mft.FileNode) *mft.FileNode {
+	if newRoot == nil || target == nil {
+		return newRoot
 	}
-	return strings.Join(parts, "  ›  ")
+	var names []string
+	for cur := target; cur != nil && cur.Parent != nil; cur = cur.Parent {
+		names = append([]string{cur.Name}, names...)
+	}
+	cur := newRoot
+	for _, n := range names {
+		next, ok := cur.Children[n]
+		if !ok || !next.IsDir {
+			return cur
+		}
+		cur = next
+	}
+	return cur
 }
+
 
 func truncMiddle(s string, w int) string {
 	if w <= 0 || len(s) <= w {
