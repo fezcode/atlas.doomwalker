@@ -1,0 +1,6 @@
+build/
+*.exe
+*.test
+.idea/
+.vscode/
+go.sum

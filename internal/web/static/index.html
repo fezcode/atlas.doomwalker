@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>atlas · doomwalker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div id="grain" aria-hidden="true"></div>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="mark">◇</span>
+    <span class="name">atlas <span class="dim">·</span> doomwalker</span>
+  </div>
+  <nav id="crumbs" class="crumbs" aria-label="Path"></nav>
+  <div class="actions">
+    <button id="up" class="btn" title="Go up (Backspace)">↰ up</button>
+  </div>
+</header>
+
+<main class="stage">
+  <section class="canvas-wrap">
+    <div class="canvas-meta">
+      <h1 id="hero-name" class="hero">—</h1>
+      <div class="hero-sub">
+        <span id="hero-size" class="num">—</span>
+        <span class="tag" id="hero-count">—</span>
+      </div>
+    </div>
+    <svg id="treemap" class="treemap" preserveAspectRatio="none"></svg>
+    <div id="tooltip" class="tooltip" hidden></div>
+  </section>
+
+  <aside class="rail">
+    <div class="rail-head">
+      <span class="label">ranking</span>
+      <span class="label dim">size</span>
+    </div>
+    <ol id="ranking" class="ranking"></ol>
+  </aside>
+</main>
+
+<footer class="footbar">
+  <div class="legend">
+    <span class="dot" style="background:#a78bfa"></span><span>directory</span>
+    <span class="dot" style="background:#71717a"></span><span>file</span>
+    <span class="dot ring"></span><span>largest</span>
+  </div>
+  <div class="hint">
+    <kbd>click</kbd> drill down · <kbd>esc</kbd> up · <kbd>⌫</kbd> up · <kbd>1–9</kbd> jump
+  </div>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
