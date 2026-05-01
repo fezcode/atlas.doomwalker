@@ -184,6 +184,16 @@ func (s *Scanner) Scan(pChan chan<- any) (*FileNode, error) {
 				if name == "" {
 					continue
 				}
+				// Skip NTFS reserved metafiles (FRNs 0–15: $MFT, $MFTMirr,
+				// $LogFile, $Volume, $AttrDef, $Bitmap, $Boot, $BadClus,
+				// $Secure, $UpCase, $Extend, …). $BadClus in particular is
+				// a sparse stream whose logical size equals the entire
+				// volume, which would otherwise inflate the root total by
+				// ~one volume size. User-visible $-prefixed entries like
+				// $Recycle.Bin live above FRN 15 and are kept.
+				if record.FileReference.RecordNumber < 16 {
+					continue
+				}
 				nodes[record.FileReference.RecordNumber] = &nodeInfo{
 					Name: name, ParentFRN: parentFRN, Size: size, IsDir: isDir,
 				}
